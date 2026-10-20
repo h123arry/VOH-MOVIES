@@ -243,6 +243,23 @@ h1 em, h2 em { font-family: var(--display); font-weight: 500; }
 .studio-state { color: #858387; font-size: 10px; line-height: 1.7; }
 .editor-placeholder { padding: 40px 10px; border-bottom: 1px solid var(--line); }
 .studio-error p { margin: 0; }
+.plans-page > .admin-notice { max-width: 760px; }
+.plan-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; margin-top: 42px; }
+.plan-card { min-height: 330px; padding: 22px; display: flex; flex-direction: column; align-items: flex-start; border: 1px solid rgba(255,255,255,.16); background: rgba(255,255,255,.025); }
+.plan-card > .eyebrow { color: #aaa8a7; font-size: 9px; }
+.plan-card h2 { margin: 10px 0 0; font-size: 25px; font-weight: 500; }
+.plan-price { margin: 14px 0; font-size: 19px; }
+.plan-price span { color: #858387; font-size: 10px; }
+.plan-benefits { display: grid; gap: 10px; margin: 8px 0 20px; padding: 0; color: #aaa8a7; font-size: 10px; list-style: none; }
+.plan-benefits li { display: flex; align-items: flex-start; gap: 7px; }
+.plan-benefits svg { flex: 0 0 auto; color: #c9c6c4; }
+.plan-note { margin-top: auto; color: #858387; font-size: 10px; }
+.plan-action { min-height: 39px; margin-top: auto; font-size: 9px; }
+.plan-action:disabled { opacity: .5; cursor: not-allowed; }
+.account-status { max-width: 620px; margin-top: 38px; padding-top: 18px; border-top: 1px solid var(--line); }
+.account-status h2 { margin: 0 0 12px; font-size: 17px; font-weight: 500; }
+.account-status p { color: #a7a5a4; font-size: 10px; line-height: 1.7; }
+.plans-page > .studio-success, .plans-page > .studio-error { margin-block: 18px; }
 
 @keyframes rise-in { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: translateY(0); } }
 @keyframes reveal-image { from { opacity: .65; transform: scale(1.04); } to { opacity: 1; transform: scale(1.015); } }
@@ -291,6 +308,8 @@ h1 em, h2 em { font-family: var(--display); font-weight: 500; }
   .mobile-nav a.active, .mobile-nav a:hover { color: white; }
   .site-footer { padding-bottom: 64px; }
   .admin-page { min-height: calc(100svh - 130px); padding-top: 101px; padding-bottom: 65px; }
+  .plan-grid { grid-template-columns: 1fr; gap: 12px; margin-top: 28px; }
+  .plan-card { min-height: 270px; padding: 18px; }
   .back-link { margin-bottom: 35px; }
   .admin-intro h1 { font-size: 53px; }
   .admin-notice { padding: 14px; }

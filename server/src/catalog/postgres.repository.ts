@@ -6,6 +6,58 @@ import { CatalogValidationError, isAvailableByRights } from '../../../src/featur
 import type { ServerConfig } from '../config.js'
 import { CatalogConflictError, type CatalogApiRepository } from './repository.js'
 
+const publicVisibilitySql = `
+  entry.publication_status = 'published'
+  AND (
+    (
+      entry.kind <> 'collection'
+      AND EXISTS (
+        SELECT 1
+        FROM catalog_distribution_rights AS rights
+        JOIN catalog_right_platforms AS platform
+          ON platform.entry_id = rights.entry_id AND platform.right_id = rights.right_id
+        JOIN catalog_right_territories AS territory
+          ON territory.entry_id = rights.entry_id AND territory.right_id = rights.right_id
+        WHERE rights.entry_id = entry.id
+          AND rights.streaming_allowed = true
+          AND platform.platform = 'web'
+          AND territory.territory_code = 'WORLDWIDE'
+          AND rights.starts_at <= now()
+          AND (rights.ends_at IS NULL OR rights.ends_at > now())
+      )
+    )
+    OR (
+      entry.kind = 'collection'
+      AND EXISTS (
+        SELECT 1
+        FROM jsonb_array_elements_text(
+          CASE
+            WHEN jsonb_typeof(entry.payload->'itemIds') = 'array' THEN entry.payload->'itemIds'
+            ELSE '[]'::jsonb
+          END
+        ) AS collection_member(item_id)
+        JOIN catalog_entries AS member ON member.id = collection_member.item_id
+        WHERE member.kind <> 'collection'
+          AND member.publication_status = 'published'
+          AND EXISTS (
+            SELECT 1
+            FROM catalog_distribution_rights AS rights
+            JOIN catalog_right_platforms AS platform
+              ON platform.entry_id = rights.entry_id AND platform.right_id = rights.right_id
+            JOIN catalog_right_territories AS territory
+              ON territory.entry_id = rights.entry_id AND territory.right_id = rights.right_id
+            WHERE rights.entry_id = member.id
+              AND rights.streaming_allowed = true
+              AND platform.platform = 'web'
+              AND territory.territory_code = 'WORLDWIDE'
+              AND rights.starts_at <= now()
+              AND (rights.ends_at IS NULL OR rights.ends_at > now())
+          )
+      )
+    )
+  )
+`
+
 export class PostgresCatalogRepository implements CatalogApiRepository {
   readonly pool: Pool
 
@@ -23,24 +75,10 @@ export class PostgresCatalogRepository implements CatalogApiRepository {
     const result = await this.pool.query<{ payload: unknown }>(`
       SELECT entry.payload
       FROM catalog_entries AS entry
-      WHERE entry.publication_status = 'published'
-        AND (
-          entry.kind = 'collection'
-          OR EXISTS (
-            SELECT 1
-            FROM catalog_distribution_rights AS rights
-            JOIN catalog_right_platforms AS platform
-              ON platform.entry_id = rights.entry_id AND platform.right_id = rights.right_id
-            WHERE rights.entry_id = entry.id
-              AND rights.streaming_allowed = true
-              AND platform.platform = 'web'
-              AND rights.starts_at <= now()
-              AND (rights.ends_at IS NULL OR rights.ends_at > now())
-          )
-        )
+      WHERE ${publicVisibilitySql}
       ORDER BY entry.normalized_title ASC, entry.id ASC
     `)
-    return result.rows.map((row) => parseStoredEntry(row.payload))
+    return sanitizePublicCollections(result.rows.map((row) => parseStoredEntry(row.payload)))
   }
 
   async getPublic(id: string): Promise<CatalogEntry | null> {
@@ -48,24 +86,13 @@ export class PostgresCatalogRepository implements CatalogApiRepository {
       SELECT entry.payload
       FROM catalog_entries AS entry
       WHERE entry.id = $1
-        AND entry.publication_status = 'published'
-        AND (
-          entry.kind = 'collection'
-          OR EXISTS (
-            SELECT 1
-            FROM catalog_distribution_rights AS rights
-            JOIN catalog_right_platforms AS platform
-              ON platform.entry_id = rights.entry_id AND platform.right_id = rights.right_id
-            WHERE rights.entry_id = entry.id
-              AND rights.streaming_allowed = true
-              AND platform.platform = 'web'
-              AND rights.starts_at <= now()
-              AND (rights.ends_at IS NULL OR rights.ends_at > now())
-          )
-        )
+        AND (${publicVisibilitySql})
       LIMIT 1
     `, [id])
-    return result.rows[0] ? parseStoredEntry(result.rows[0].payload) : null
+    if (!result.rows[0]) return null
+    const entry = parseStoredEntry(result.rows[0].payload)
+    if (entry.kind !== 'collection') return entry
+    return (await this.listPublic()).find((publicEntry) => publicEntry.id === id) ?? null
   }
 
   async listAdmin(): Promise<CatalogEntry[]> {
@@ -111,10 +138,36 @@ export class PostgresCatalogRepository implements CatalogApiRepository {
 
   async checkReady(): Promise<void> {
     await this.pool.query('SELECT 1')
-    const result = await this.pool.query<{ migration_table: string | null }>("SELECT to_regclass('schema_migrations')::text AS migration_table")
-    if (!result.rows[0]?.migration_table) throw new Error('Catalog migrations are missing; run npm run db:migrate before starting the API.')
-    const catalog = await this.pool.query<{ catalog_table: string | null }>("SELECT to_regclass('catalog_entries')::text AS catalog_table")
-    if (!catalog.rows[0]?.catalog_table) throw new Error('Catalog schema is missing; run npm run db:migrate before starting the API.')
+    const result = await this.pool.query<{ missing_table: string }>(`
+      SELECT required.name AS missing_table
+      FROM unnest(ARRAY[
+        'schema_migrations',
+        'catalog_entries',
+        'catalog_genres',
+        'catalog_entry_genres',
+        'catalog_actors',
+        'catalog_characters',
+        'catalog_character_actors',
+        'catalog_entry_cast',
+        'catalog_seasons',
+        'catalog_episodes',
+        'catalog_episode_cast',
+        'catalog_episode_characters',
+        'catalog_distribution_rights',
+        'catalog_right_territories',
+        'catalog_right_platforms',
+        'monetization_plans',
+        'payment_transactions',
+        'subscriptions',
+        'rental_entitlements',
+        'payment_webhook_events',
+        'payment_reconciliation'
+      ]) AS required(name)
+      WHERE to_regclass(required.name) IS NULL
+    `)
+    if (result.rows.length > 0) {
+      throw new Error(`Catalog migrations are incomplete; missing tables: ${result.rows.map((row) => row.missing_table).join(', ')}. Run npm run db:migrate before starting the API.`)
+    }
   }
 
   private async insertEntry(client: PoolClient, entry: CatalogEntry): Promise<void> {
@@ -210,6 +263,13 @@ function assertPublishable(entry: CatalogEntry): void {
 
 function parseStoredEntry(value: unknown): CatalogEntry {
   return parseEntry(typeof value === 'string' ? JSON.parse(value) : value)
+}
+
+function sanitizePublicCollections(entries: CatalogEntry[]): CatalogEntry[] {
+  const publicTitleIds = new Set(entries.filter((entry) => entry.kind !== 'collection').map((entry) => entry.id))
+  return entries.map((entry) => entry.kind === 'collection'
+    ? { ...entry, itemIds: entry.itemIds.filter((id) => publicTitleIds.has(id)) }
+    : entry)
 }
 
 function valuesFor(entry: CatalogEntry): unknown[] {

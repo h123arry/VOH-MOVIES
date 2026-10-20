@@ -4,7 +4,7 @@ import { findCatalogDuplicates, parseCatalogEntry, parseCatalogList } from './ca
 
 export class CatalogRepositoryError extends Error {
   constructor(
-    readonly code: 'not-configured' | 'network' | 'http' | 'conflict' | 'not-found' | 'storage',
+    readonly code: 'not-configured' | 'network' | 'http' | 'conflict' | 'not-found' | 'unauthorized' | 'forbidden' | 'unavailable' | 'storage',
     message: string,
   ) {
     super(message)
@@ -25,8 +25,11 @@ export interface CatalogRepository {
 
 export class HttpCatalogRepository implements CatalogRepository {
   readonly mode = 'api' as const
+  private readonly baseUrl?: string
 
-  constructor(private readonly baseUrl = catalogConfig.apiBaseUrl) {}
+  constructor(baseUrl = catalogConfig.apiBaseUrl) {
+    this.baseUrl = baseUrl?.replace(/\/+$/, '')
+  }
 
   async list(signal?: AbortSignal): Promise<unknown> {
     return this.request('/catalog', { method: 'GET', signal })
@@ -80,14 +83,14 @@ export class HttpCatalogRepository implements CatalogRepository {
       throw new CatalogRepositoryError('network', 'Could not reach the VOH catalogue service.')
     }
 
-    if (response.status === 409) {
-      throw new CatalogRepositoryError('conflict', 'The catalogue already contains a conflicting record.')
-    }
-    if (response.status === 404) {
-      throw new CatalogRepositoryError('not-found', 'The catalogue record was not found.')
-    }
     if (!response.ok) {
-      throw new CatalogRepositoryError('http', `Catalogue request failed (${response.status}).`)
+      const message = await readErrorMessage(response)
+      if (response.status === 409) throw new CatalogRepositoryError('conflict', message ?? 'The catalogue already contains a conflicting record.')
+      if (response.status === 404) throw new CatalogRepositoryError('not-found', message ?? 'The catalogue record was not found.')
+      if (response.status === 401) throw new CatalogRepositoryError('unauthorized', message ?? 'Sign in is required to access this catalog operation.')
+      if (response.status === 403) throw new CatalogRepositoryError('forbidden', message ?? 'You are not authorized to access this catalog operation.')
+      if (response.status === 503) throw new CatalogRepositoryError('unavailable', message ?? 'The catalog service is temporarily unavailable.')
+      throw new CatalogRepositoryError('http', message ?? `Catalogue request failed (${response.status}).`)
     }
     if (init.expectJson === false || response.status === 204) return undefined
 
@@ -97,6 +100,19 @@ export class HttpCatalogRepository implements CatalogRepository {
       throw new CatalogRepositoryError('http', 'The catalogue service returned invalid JSON.')
     }
   }
+
+}
+
+async function readErrorMessage(response: Response): Promise<string | undefined> {
+  try {
+    const body: unknown = await response.json()
+    if (typeof body === 'object' && body !== null && 'message' in body && typeof body.message === 'string') {
+      return body.message
+    }
+  } catch {
+    return undefined
+  }
+  return undefined
 }
 
 export class LocalCatalogRepository implements CatalogRepository {

@@ -1,5 +1,6 @@
 import cors from '@fastify/cors'
 import Fastify, { type FastifyInstance, type preHandlerHookHandler } from 'fastify'
+import { z } from 'zod'
 import {
   ActorSchema,
   CatalogEntrySchema,
@@ -15,14 +16,18 @@ import { CatalogValidationError } from '../../src/features/catalog/catalog.valid
 import { DenyAllAdminAuthorizer, type AdminAuthorizer } from './catalog/authorization.js'
 import { CatalogConflictError, type CatalogApiRepository } from './catalog/repository.js'
 import type { ServerConfig } from './config.js'
+import { BillingRequestError, BillingService } from './payments/service.js'
+import { PaymentConfigurationError, PaymentProviderError } from './payments/provider.js'
+import { PaymentConflictError } from './payments/postgres.repository.js'
 
 interface ApiOptions {
   repository: CatalogApiRepository
   config: Pick<ServerConfig, 'allowedOrigins'>
   authorizer?: AdminAuthorizer
+  billing?: BillingService
 }
 
-export function createApiApp({ repository, config, authorizer = new DenyAllAdminAuthorizer() }: ApiOptions): FastifyInstance {
+export function createApiApp({ repository, config, authorizer = new DenyAllAdminAuthorizer(), billing }: ApiOptions): FastifyInstance {
   const app = Fastify({ logger: false, bodyLimit: 2 * 1024 * 1024 })
   void app.register(cors, {
     origin(origin, callback) {
@@ -32,30 +37,47 @@ export function createApiApp({ repository, config, authorizer = new DenyAllAdmin
     credentials: true,
   })
 
-  app.addHook('onClose', async () => repository.close())
+  app.addHook('onClose', async () => {
+    await Promise.all([repository.close(), billing?.close?.()])
+  })
   app.setErrorHandler((error, _request, reply) => {
     if (error instanceof CatalogConflictError) return reply.code(409).send({ error: 'duplicate', message: error.message })
     if (error instanceof CatalogValidationError) return reply.code(400).send({ error: 'invalid_record', message: error.message, issues: error.issues })
-    if (error instanceof SyntaxError) return reply.code(400).send({ error: 'invalid_json', message: 'Request body must be valid JSON.' })
+    if (error instanceof PaymentConflictError) return reply.code(409).send({ error: 'payment_conflict', message: error.message })
+    if (error instanceof BillingRequestError) return reply.code(error.statusCode).send({ error: error.code, message: error.message })
+    if (error instanceof PaymentConfigurationError) return reply.code(503).send({ error: 'payment_not_configured', message: error.message })
+    if (error instanceof PaymentProviderError) return reply.code(502).send({ error: 'payment_provider_unavailable', message: error.message })
+    const errorCode = typeof error === 'object' && error !== null && 'code' in error && typeof error.code === 'string'
+      ? error.code
+      : undefined
+    if (error instanceof SyntaxError || errorCode === 'FST_ERR_CTP_INVALID_JSON_BODY') {
+      return reply.code(400).send({ error: 'invalid_json', message: 'Request body must be valid JSON.' })
+    }
+    if (errorCode === 'FST_ERR_CTP_BODY_TOO_LARGE') {
+      return reply.code(413).send({ error: 'request_too_large', message: 'Request body exceeds the 2 MB limit.' })
+    }
     return reply.code(500).send({ error: 'internal_error', message: 'The catalogue operation failed.' })
   })
 
   const requireAdmin = (permission: 'catalog:read' | 'catalog:write'): preHandlerHookHandler => async (request, reply) => {
     if (!authorizer.configured) {
-      await reply.code(503).send({ error: 'authorization_not_configured', message: 'Admin API is disabled until server-side authentication is configured.' })
-      return
+      return reply.code(503).send({ error: 'authorization_not_configured', message: 'Admin API is disabled until server-side authentication is configured.' })
+    }
+    const origin = request.headers.origin
+    if ((origin !== undefined && !config.allowedOrigins.includes(origin)) ||
+      (permission === 'catalog:write' && (origin === undefined || !config.allowedOrigins.includes(origin)))) {
+      return reply.code(403).send({ error: 'origin_not_allowed', message: 'This origin is not allowed to access administrative operations.' })
     }
     try {
       const principal = await authorizer.authorize(request)
       if (!principal) {
-        await reply.code(401).send({ error: 'unauthorized', message: 'Authentication is required.' })
-        return
+        return reply.code(401).send({ error: 'unauthorized', message: 'Authentication is required.' })
       }
       if (!principal.permissions.includes(permission)) {
-        await reply.code(403).send({ error: 'forbidden', message: 'This account is not authorized for this catalog operation.' })
+        return reply.code(403).send({ error: 'forbidden', message: 'This account is not authorized for this catalog operation.' })
       }
     } catch {
-      await reply.code(503).send({ error: 'authorization_unavailable', message: 'Authorization could not be verified.' })
+      return reply.code(503).send({ error: 'authorization_unavailable', message: 'Authorization could not be verified.' })
     }
   }
 
@@ -69,46 +91,181 @@ export function createApiApp({ repository, config, authorizer = new DenyAllAdmin
   })
 
   app.get('/catalog', async (_request, reply) => {
-    try { return { items: await repository.listPublic() } } catch { return reply.code(503).send({ error: 'catalog_unavailable' }) }
+    try { return { items: await repository.listPublic() } } catch { return reply.code(503).send({ error: 'catalog_unavailable', message: 'The public catalog is temporarily unavailable.' }) }
   })
   app.get<{ Params: { id: string } }>('/catalog/:id', async (request, reply) => {
     try {
       const item = await repository.getPublic(request.params.id)
-      return item ? { item } : reply.code(404).send({ error: 'not_found' })
-    } catch { return reply.code(503).send({ error: 'catalog_unavailable' }) }
+      return item ? { item } : reply.code(404).send({ error: 'not_found', message: 'The public catalog record was not found.' })
+    } catch { return reply.code(503).send({ error: 'catalog_unavailable', message: 'The public catalog is temporarily unavailable.' }) }
   })
 
   app.get('/admin/catalog', { preHandler: requireAdmin('catalog:read') }, async (_request, reply) => {
-    try { return { items: await repository.listAdmin() } } catch { return reply.code(503).send({ error: 'catalog_unavailable' }) }
+    try { return { items: await repository.listAdmin() } } catch { return reply.code(503).send({ error: 'catalog_unavailable', message: 'The catalog is temporarily unavailable.' }) }
   })
   app.get<{ Params: { id: string } }>('/admin/catalog/:id', { preHandler: requireAdmin('catalog:read') }, async (request, reply) => {
     try {
       const item = await repository.getAdmin(request.params.id)
-      return item ? { item } : reply.code(404).send({ error: 'not_found' })
-    } catch { return reply.code(503).send({ error: 'catalog_unavailable' }) }
+      return item ? { item } : reply.code(404).send({ error: 'not_found', message: 'The catalog record was not found.' })
+    } catch { return reply.code(503).send({ error: 'catalog_unavailable', message: 'The catalog is temporarily unavailable.' }) }
   })
   app.post('/admin/catalog', { preHandler: requireAdmin('catalog:write') }, async (request, reply) => {
     const parsed = CatalogEntrySchema.safeParse(request.body)
-    if (!parsed.success) return reply.code(400).send({ error: 'invalid_record', issues: parsed.error.issues })
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_record', message: 'The catalog record is invalid.', issues: parsed.error.issues })
     try { return reply.code(201).send({ item: await repository.create(parsed.data) }) } catch (error) { return sendMutationError(error, reply) }
   })
   app.put<{ Params: { id: string } }>('/admin/catalog/:id', { preHandler: requireAdmin('catalog:write') }, async (request, reply) => {
     const parsed = CatalogEntrySchema.safeParse(request.body)
-    if (!parsed.success) return reply.code(400).send({ error: 'invalid_record', issues: parsed.error.issues })
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_record', message: 'The catalog record is invalid.', issues: parsed.error.issues })
     if (parsed.data.id !== request.params.id) return reply.code(400).send({ error: 'id_mismatch', message: 'Record ID cannot change during an update.' })
     try {
       const item = await repository.update(request.params.id, parsed.data)
-      return item ? { item } : reply.code(404).send({ error: 'not_found' })
+      return item ? { item } : reply.code(404).send({ error: 'not_found', message: 'The catalog record was not found.' })
     } catch (error) { return sendMutationError(error, reply) }
   })
   app.delete<{ Params: { id: string } }>('/admin/catalog/:id', { preHandler: requireAdmin('catalog:write') }, async (request, reply) => {
     try {
-      return await repository.delete(request.params.id) ? reply.code(204).send() : reply.code(404).send({ error: 'not_found' })
+      return await repository.delete(request.params.id) ? reply.code(204).send() : reply.code(404).send({ error: 'not_found', message: 'The catalog record was not found.' })
     } catch (error) { return sendMutationError(error, reply) }
   })
 
   registerNestedCrud(app, repository, requireAdmin)
+  registerBillingRoutes(app, billing, authorizer, config.allowedOrigins)
   return app
+}
+
+const subscriptionCheckoutSchema = z.object({ planCode: z.enum(['MEDIUM', 'PRO']) }).strict()
+const rentalIdSchema = z.string().trim().min(1).max(128)
+
+function registerBillingRoutes(
+  app: FastifyInstance,
+  billing: BillingService | undefined,
+  authorizer: AdminAuthorizer,
+  allowedOrigins: string[],
+) {
+  app.get('/billing/plans', async (_request, reply) => {
+    if (!billing) return reply.code(503).send({ error: 'monetization_unavailable', message: 'Monetization services are not configured.' })
+    return billing.listPlans()
+  })
+
+  app.get('/billing/me', async (request, reply) => {
+    const identity = await authenticateBillingAccount(request, reply, authorizer, allowedOrigins, false)
+    if (!identity) return
+    if (!billing) return reply.code(503).send({ error: 'monetization_unavailable', message: 'Monetization services are not configured.' })
+    try {
+      return { entitlements: await billing.getEntitlements(identity.subject) }
+    } catch {
+      return reply.code(503).send({ error: 'entitlements_unavailable', message: 'Account entitlements are temporarily unavailable.' })
+    }
+  })
+
+  app.post('/billing/checkout', async (request, reply) => {
+    const identity = await authenticateBillingAccount(request, reply, authorizer, allowedOrigins, true)
+    if (!identity) return
+    if (!billing) return reply.code(503).send({ error: 'monetization_unavailable', message: 'Monetization services are not configured.' })
+    const parsed = subscriptionCheckoutSchema.safeParse(request.body)
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_checkout', message: 'Choose a configured paid plan.' })
+    const idempotencyKey = request.headers['idempotency-key']
+    if (typeof idempotencyKey !== 'string') return reply.code(400).send({ error: 'idempotency_key_required', message: 'An Idempotency-Key header is required.' })
+    try {
+      const checkout = await billing.startSubscriptionCheckout(identity.subject, identity.emailVerified ? identity.email : undefined, parsed.data.planCode, idempotencyKey)
+      return reply.code(checkout.status === 'ready' ? 200 : 202).send(checkout)
+    } catch (error) {
+      return sendBillingError(error, reply)
+    }
+  })
+
+  app.post('/billing/subscription/cancel', async (request, reply) => {
+    const identity = await authenticateBillingAccount(request, reply, authorizer, allowedOrigins, true)
+    if (!identity) return
+    if (!billing) return reply.code(503).send({ error: 'monetization_unavailable', message: 'Monetization services are not configured.' })
+    try {
+      return await billing.cancelSubscription(identity.subject)
+    } catch (error) {
+      return sendBillingError(error, reply)
+    }
+  })
+
+  app.post<{ Params: { id: string } }>('/billing/rentals/:id/checkout', async (request, reply) => {
+    const identity = await authenticateBillingAccount(request, reply, authorizer, allowedOrigins, true)
+    if (!identity) return
+    if (!billing) return reply.code(503).send({ error: 'monetization_unavailable', message: 'Monetization services are not configured.' })
+    const parsedId = rentalIdSchema.safeParse(request.params.id)
+    if (!parsedId.success) return reply.code(400).send({ error: 'invalid_catalog_id', message: 'The catalog item ID is invalid.' })
+    const idempotencyKey = request.headers['idempotency-key']
+    if (typeof idempotencyKey !== 'string') return reply.code(400).send({ error: 'idempotency_key_required', message: 'An Idempotency-Key header is required.' })
+    try {
+      const checkout = await billing.startRentalCheckout(identity.subject, identity.emailVerified ? identity.email : undefined, parsedId.data, idempotencyKey)
+      return reply.code(checkout.status === 'ready' ? 200 : 202).send(checkout)
+    } catch (error) {
+      return sendBillingError(error, reply)
+    }
+  })
+
+  app.post<{ Params: { reference: string } }>('/billing/payments/:reference/verify', async (request, reply) => {
+    const identity = await authenticateBillingAccount(request, reply, authorizer, allowedOrigins, true)
+    if (!identity) return
+    if (!billing) return reply.code(503).send({ error: 'monetization_unavailable', message: 'Monetization services are not configured.' })
+    try {
+      return await billing.verifyForAccount(identity.subject, request.params.reference)
+    } catch (error) {
+      return sendBillingError(error, reply)
+    }
+  })
+
+  void app.register(async (webhookApp) => {
+    webhookApp.addContentTypeParser('application/json', { parseAs: 'buffer' }, (_request, body, done) => done(null, body))
+    webhookApp.post('/billing/webhooks/paystack', async (request, reply) => {
+      if (!billing) return reply.code(503).send({ error: 'monetization_unavailable', message: 'Payment webhook processing is not configured.' })
+      if (!Buffer.isBuffer(request.body)) return reply.code(400).send({ error: 'invalid_webhook', message: 'Expected a JSON request body.' })
+      try {
+        const signatureHeader = request.headers['x-paystack-signature']
+        const signature = typeof signatureHeader === 'string' ? signatureHeader : undefined
+        const result = await billing.processWebhook(request.body, signature)
+        return reply.code(200).send({ received: true, result })
+      } catch (error) {
+        return sendBillingError(error, reply)
+      }
+    })
+  })
+}
+
+async function authenticateBillingAccount(
+  request: Parameters<preHandlerHookHandler>[0],
+  reply: Parameters<preHandlerHookHandler>[1],
+  authorizer: AdminAuthorizer,
+  allowedOrigins: string[],
+  requireOrigin: boolean,
+) {
+  if (!authorizer.configured) {
+    await reply.code(503).send({ error: 'authentication_not_configured', message: 'Account authentication is not configured.' })
+    return null
+  }
+  const origin = request.headers.origin
+  if ((origin !== undefined && !allowedOrigins.includes(origin)) ||
+    (requireOrigin && (origin === undefined || !allowedOrigins.includes(origin)))) {
+    await reply.code(403).send({ error: 'origin_not_allowed', message: 'This origin is not allowed to access this account operation.' })
+    return null
+  }
+  try {
+    const principal = await authorizer.authorize(request)
+    if (!principal) {
+      await reply.code(401).send({ error: 'unauthorized', message: 'A valid account session is required.' })
+      return null
+    }
+    return principal
+  } catch {
+    await reply.code(503).send({ error: 'authentication_unavailable', message: 'Account authentication could not be verified.' })
+    return null
+  }
+}
+
+function sendBillingError(error: unknown, reply: { code: (status: number) => { send: (body: unknown) => unknown } }) {
+  if (error instanceof BillingRequestError) return reply.code(error.statusCode).send({ error: error.code, message: error.message })
+  if (error instanceof PaymentConfigurationError) return reply.code(503).send({ error: 'payment_not_configured', message: error.message })
+  if (error instanceof PaymentProviderError) return reply.code(502).send({ error: 'payment_provider_unavailable', message: error.message })
+  if (error instanceof PaymentConflictError) return reply.code(409).send({ error: 'payment_conflict', message: error.message })
+  return reply.code(503).send({ error: 'payment_service_unavailable', message: 'The payment operation could not be completed.' })
 }
 
 function registerNestedCrud(app: FastifyInstance, repository: CatalogApiRepository, requireAdmin: (permission: 'catalog:read' | 'catalog:write') => preHandlerHookHandler) {

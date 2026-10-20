@@ -11,6 +11,7 @@ export function SiteHeader() {
           <NavLink to="/" end>Discover</NavLink>
           <a href="/#catalogue">Catalogue</a>
           <a href="/#my-list">My list</a>
+          <NavLink to="/plans">Plans</NavLink>
         </nav>
         <div className="header-actions">
           <a className="icon-link search-link" href="/#catalogue" aria-label="Search catalogue" title="Search catalogue">

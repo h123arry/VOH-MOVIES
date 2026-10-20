@@ -1,6 +1,7 @@
 import { BrowserRouter, Route, Routes } from 'react-router-dom'
 import { CatalogStudioPage } from '../features/admin/CatalogStudioPage'
 import { HomePage } from '../features/catalog/HomePage'
+import { PlansPage } from '../features/monetization/PlansPage'
 import { NotFoundPage } from './NotFoundPage'
 import { SiteLayout } from './SiteLayout'
 
@@ -11,6 +12,7 @@ export function App() {
         <Route element={<SiteLayout />}>
           <Route index element={<HomePage />} />
           <Route path="admin" element={<CatalogStudioPage />} />
+          <Route path="plans" element={<PlansPage />} />
           <Route path="*" element={<NotFoundPage />} />
         </Route>
       </Routes>

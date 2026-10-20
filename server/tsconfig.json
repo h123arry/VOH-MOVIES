@@ -12,5 +12,6 @@
     "rootDir": "..",
     "types": ["node"]
   },
-  "include": ["src/**/*.ts", "../src/features/catalog/catalog.models.ts", "../src/features/catalog/catalog.validation.ts"]
+  "include": ["src/**/*.ts", "../src/features/catalog/catalog.models.ts", "../src/features/catalog/catalog.validation.ts"],
+  "exclude": ["src/**/*.test.ts"]
 }

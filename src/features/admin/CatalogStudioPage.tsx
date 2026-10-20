@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { ArrowLeft, Check, Film, Plus, Save, Trash2 } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { CatalogEntrySchema, type CatalogEntry } from '../catalog/catalog.models'
+import { catalogConfig } from '../catalog/catalog.config'
 import { catalogService } from '../catalog/catalog.service'
 import { useCatalog } from '../catalog/useCatalog'
 
@@ -19,6 +20,11 @@ export function CatalogStudioPage() {
   const [retryAction, setRetryAction] = useState<RetryAction | null>(null)
   const records = catalog.status === 'ready' ? catalog.items : []
   const selected = records.find((record) => record.id === selectedId)
+  const storageMode = catalog.status === 'ready'
+    ? catalog.storage
+    : catalogConfig.apiBaseUrl
+      ? 'api'
+      : 'device'
 
   const startNew = (kind: 'film' | 'series') => {
     const base = {
@@ -132,7 +138,7 @@ export function CatalogStudioPage() {
         <p className="admin-lede">Create and maintain verified catalog records. JSON is validated against the catalog domain schema before every write.</p>
       </section>
 
-      <div className="admin-notice"><Film size={18} /><p><strong>{catalog.status === 'ready' && catalog.storage === 'device' ? 'Device-local storage.' : 'Server authorization required.'}</strong> {catalog.status === 'ready' && catalog.storage === 'device' ? 'Records are saved only in this browser and are not shared or synchronized.' : 'This interface is not an authentication boundary. A connected API must authorize every write.'}</p></div>
+      <div className="admin-notice"><Film size={18} /><p><strong>{storageMode === 'device' ? 'Device-local storage.' : 'Server API mode.'}</strong> {storageMode === 'device' ? 'Records are saved only in this browser and are not shared or synchronized.' : 'Catalog requests use the configured API, which must authenticate and authorize every administrative operation. This interface is not an authentication boundary.'}</p></div>
 
       <div className="studio-layout" aria-busy={catalog.status === 'loading' || busy}>
         <section className="studio-records" aria-label="Catalog records">
